@@ -22,11 +22,11 @@ from transformers import (AdamW, OpenAIGPTDoubleHeadsModel, OpenAIGPTTokenizer,
                                   GPT2DoubleHeadsModel, GPT2Tokenizer, WEIGHTS_NAME, CONFIG_NAME)
 
 from utils import get_dataset, make_logdir
-import sys
+import sys, shutil
 
 SPECIAL_TOKENS = ["<bos>", "<eos>", "<speaker1>", "<speaker2>", "<pad>"]
 ATTR_TO_SPECIAL_TOKEN = {'bos_token': '<bos>', 'eos_token': '<eos>', 'pad_token': '<pad>',
-                         'additional_special_tokens': ['<speaker1>', '<speaker2>']}
+                         'additional_special_tokens': ['<speaker1>', '<speaker2>', '<persona>']}
 MODEL_INPUTS = ["input_ids", "mc_token_ids", "lm_labels", "mc_labels", "token_type_ids"]
 PADDED_INPUTS = ["input_ids", "lm_labels", "token_type_ids"]
 
@@ -74,7 +74,9 @@ def build_input_from_segments(persona, history, reply, tokenizer, lm_labels=Fals
 def get_data_loaders(args, tokenizer):
     """ Prepare the dataset for training and evaluation """
     personachat = get_dataset(tokenizer, args.dataset_path, args.dataset_cache)
-
+    
+    personachat = {'train': personachat['train'], 'valid': personachat['valid']}
+    
     logger.info("Build inputs and labels")
     datasets = {"train": defaultdict(list), "valid": defaultdict(list)}
     for dataset_name, dataset in personachat.items():
@@ -83,15 +85,19 @@ def get_data_loaders(args, tokenizer):
 #         print('\n\nTruncating dataset %s to 100\n\n' % dataset_name)
 #         dataset = dataset[:100]
     
-    
         num_candidates = len(dataset[0]["utterances"][0]["candidates"])
         if args.num_candidates > 0 and dataset_name == 'train':
             num_candidates = min(args.num_candidates, num_candidates)
+        if args.num_candidates_valid > 0 and dataset_name == 'valid':
+            num_candidates = min(args.num_candidates_valid, num_candidates)
         for dialog in dataset:
             persona = dialog["personality"].copy()
             for _ in range(args.personality_permutations):
                 for utterance in dialog["utterances"]:
-                    history = utterance["history"][-(2*args.max_history+1):]
+                    if type(utterance["history"]) == dict:
+                        history = utterance["history"]['sen_list'][-(2*args.max_history+1):]
+                    else:
+                        history = utterance["history"][-(2*args.max_history+1):]
                     for j, candidate in enumerate(utterance["candidates"][-num_candidates:]):
                         lm_labels = bool(j == num_candidates-1)
                         instance = build_input_from_segments(persona, history, candidate, tokenizer, lm_labels)
@@ -147,6 +153,9 @@ def train():
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training (-1: not distributed)")
     
     parser.add_argument("--h_coef", type=float, default=0, help="Entropy loss penalty coefficient")
+    parser.add_argument("--tune_head_only", action='store_true', help="Freeze model and only tune linear head decoder")
+    parser.add_argument("--num_candidates_valid", type=int, default=2, help="Number of candidates for validation")
+    
     
     args = parser.parse_args()
 
@@ -180,7 +189,22 @@ def train():
     
     # Add special tokens if they are not already added
     add_special_tokens_(model, tokenizer)
-    optimizer = AdamW(model.parameters(), lr=args.lr, correct_bias=True)
+    
+    if args.tune_head_only:
+        logger.info("Only tuning token embedding & decoder heads!")
+        for param in model.parameters():
+            param.requires_grad = False
+        model.lm_head.weight.requires_grad = True # linear (vocab) head
+        model.transformer.wte.weight.requires_grad = True # token embedding
+        model.multiple_choice_head.summary.weight.requires_grad = True # multiple choice head
+        model.multiple_choice_head.summary.bias.requires_grad = True # multiple choice head
+#         for name, param in model.named_parameters():
+#             if param.requires_grad:
+#                 print(name)
+        optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, correct_bias=True)
+    else:
+        logger.info("Tuning all model parameters")
+        optimizer = AdamW(model.parameters(), lr=args.lr, correct_bias=True)
 
     # Prepare model for FP16 and distributed training if needed (order is important, distributed should be the last)
     if args.fp16:
@@ -209,9 +233,9 @@ def train():
             # sum over vocab and average across tokens in ground truth.
             # taking average over tokens because c-e loss default reduction is mean
             # so this should better scale to balance the c-e loss and entropy penalty. 
-            ent = (prob * log_prob).sum(dim=-1).mean() 
+            neg_ent = -(prob * log_prob).sum(dim=-1).mean() # NOTE: negative entropy
         
-            h_penalty += ent
+            h_penalty += neg_ent
         return h_penalty
         
     # Training function and trainer
@@ -265,12 +289,10 @@ def train():
             lm_logits, mc_logits, *_ = model(
                 input_ids, token_type_ids=token_type_ids, mc_token_ids=mc_token_ids,
             )
-            lm_logits_shifted = lm_logits[..., :-1, :].contiguous()
-            lm_labels_shifted = lm_labels[..., 1:].contiguous()
-            lm_logits_flat_shifted = lm_logits_shifted.view(-1, lm_logits.size(-1))
-            lm_labels_flat_shifted = lm_labels_shifted.view(-1)
+            lm_logits_flat_shifted = lm_logits[..., :-1, :].contiguous().view(-1, lm_logits.size(-1))
+            lm_labels_flat_shifted = lm_labels[..., 1:].contiguous().view(-1)
             
-            loss_fct = CrossEntropyLoss()
+            loss_fct = torch.nn.CrossEntropyLoss()
             mc_loss = loss_fct(mc_logits.view(-1, mc_logits.size(-1)), mc_labels.view(-1))
             lm_loss = loss_fct(lm_logits_flat_shifted, lm_labels_flat_shifted)
             h_penalty = 0
@@ -327,7 +349,8 @@ def train():
         tb_logger.attach(trainer, log_handler=OptimizerParamsHandler(optimizer), event_name=Events.ITERATION_STARTED)
         tb_logger.attach(evaluator, log_handler=OutputHandler(tag="validation", metric_names=list(metrics.keys()), another_engine=trainer), event_name=Events.EPOCH_COMPLETED)
 
-        checkpoint_handler = ModelCheckpoint(log_dir, 'checkpoint', save_interval=1, n_saved=3)
+        # checkpoint_handler = ModelCheckpoint(log_dir, 'checkpoint', save_interval=1, n_saved=3)
+        checkpoint_handler = ModelCheckpoint(log_dir, 'checkpoint', n_saved=None)
         trainer.add_event_handler(Events.EPOCH_COMPLETED, checkpoint_handler, {'mymodel': getattr(model, 'module', model)})  # "getattr" takes care of distributed encapsulation
 
         torch.save(args, log_dir + '/model_training_args.bin')
@@ -339,7 +362,8 @@ def train():
 
     # On the main process: close tensorboard logger and rename the last checkpoint (for easy re-loading with OpenAIGPTModel.from_pretrained method)
     if args.local_rank in [-1, 0] and args.n_epochs > 0:
-        os.rename(os.path.join(log_dir, checkpoint_handler._saved[-1][1]), os.path.join(log_dir, WEIGHTS_NAME))  # TODO: PR in ignite to have better access to saved file paths (cleaner)
+        shutil.copy2(os.path.join(log_dir, checkpoint_handler._saved[-1][1]), os.path.join(log_dir, WEIGHTS_NAME))
+#         os.rename(os.path.join(log_dir, checkpoint_handler._saved[-1][1]), os.path.join(log_dir, WEIGHTS_NAME))  # TODO: PR in ignite to have better access to saved file paths (cleaner)
         tb_logger.close()
 
 if __name__ == "__main__":

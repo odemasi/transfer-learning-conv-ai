@@ -159,7 +159,11 @@ class TransformerAgent(Agent):
             out_text = self.tokenizer.decode(out_ids, skip_special_tokens=True,
                                              clean_up_tokenization_spaces=(self.args.eval_type != 'f1'))
             out_tokens = self.tokenizer.convert_ids_to_tokens(out_ids, skip_special_tokens=True)
-            reply = {'text': out_text, 'tokens': out_tokens}
+            
+            if self.args.return_tokens:        
+                reply = {'text': out_text, 'tokens': out_tokens, 'episode_done': False}
+            else: 
+                reply = {'text': out_text, 'episode_done': False}
 
         return reply
 
@@ -283,6 +287,7 @@ if __name__ == '__main__':
     setup_args.set_params(
         model='tuning_evaluation:TransformerAgent')
     setup_args.set_params(num_examples=-1)
+    parser.set_params(return_tokens=True)
     
     opt = setup_args.parse_args(print_args=False)
     print(opt)
