@@ -1,0 +1,78 @@
+
+
+python ./train_distil.py --model_class="distilgpt2" --model_checkpoint="distilgpt2" --train_batch_size=2 --valid_batch_size=2
+
+
+python ./train_distil.py --model_class="distilgpt2" --model_checkpoint="distilgpt2" --train_batch_size=2 --valid_batch_size=2 --gradient_accumulation_steps=4 --lm_coef=2.0 --max_history=2 --n_epochs=3 --num_candidates=4 --personality_permutations=2 
+
+
+
+
+python ./interact.py --model_class="gpt2" --model_checkpoint="gpt2" --truncate_input=512 --dataset_path data/json_transfertransfo_crisisbot_v1.json 
+
+
+
+
+
+cd ParlAI
+python ../tuning_evaluation.py --eval_type ppl  --model_checkpoint='distilgpt2'
+
+
+
+
+python ../tuning_evaluation.py --eval_type ppl  --model_checkpoint ../runs/Jun30_15-47-43_language_gpt2/ > ../eval_metric/tuned_gpt2_eval.txt
+
+
+python ../tuning_evaluation.py --eval_type ppl  --model_checkpoint ../runs/Jun30_15-22-13_language_distilgpt2/ > ../eval_metric/tuned_distilgpt2_eval.txt
+
+
+tensorboard --logdir experiments --port 6006 
+
+
+
+# space: batch, seq_len, vocab
+prob = F.softmax(pre_prob, dim=-1)
+log_prob = F.log_softmax(pre_prob, dim=-1)
+entropy = (prob * log_prob).sum(dim=-1)
+mean_entropy = entropy.mean()
+
+
+
+
+python ../self_chat.py -mf ../runs/Jun30_15-22-13_language_distilgpt2/ -t convai2:selfchat
+
+
+python ../self_chat.py --model_checkpoint ../runs/Jun30_15-22-13_language_distilgpt2/ -t convai2:selfchat --outfile ./selfchats/distilgpt2.json > ./selfchats/distilgpt2.txt
+
+python ../self_chat.py --model_checkpoint ../runs/Jun30_15-47-43_language_gpt2/ -t convai2:selfchat --outfile ./selfchats/gpt2.json > ./selfchats/gpt2.txt
+
+python ../self_chat.py --model_checkpoint ../runs/Jun30_15-47-43_language_gpt2/ -t convai2:selfchat --outfile ./selfchats/gpt2.json > ./selfchats/gpt2.txt
+
+python ../self_chat.py --model_checkpoint ../runs/Jul06_10-33-33_language_gpt2/ -t convai2:selfchat --outfile ./selfchats/gpt2.json --top_k 0 > ./selfchats/gpt2_h_2.txt
+
+
+CUDA_VISIBLE_DEVICES=5 python ./evaluate.py --model="gpt2" --model_checkpoint ./runs/Jul08_12-45-55_language_gpt2 --max_history=1 --dataset_path data/json_transfertransfo_crisisbot.json
+
+
+
+python ./evaluate_validation_curve.py --model="gpt2" --model_checkpoint ./runs/Jul09_22-34-31_language_gpt2 --max_history=1 --dataset_path data/json_transfertransfo_crisisbot.json
+python ./evaluate_validation_curve.py --model="gpt2" --model_checkpoint ./runs/Jul08_12-45-55_language_gpt2 --max_history=1 --dataset_path data/json_transfertransfo_crisisbot.json
+
+
+
+CUDA_VISIBLE_DEVICES=5 python ./train_distil.py --model_class="gpt2" --model_checkpoint="gpt2" --train_batch_size=1 --valid_batch_size=1 --gradient_accumulation_steps=4 --lm_coef=2.0 --mc_coef=0.0 --h_coef=0.0 --max_history=1 --n_epochs=7 --num_candidates=4 --personality_permutations=1 --dataset_path data/json_transfertransfo_crisisbot.json
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

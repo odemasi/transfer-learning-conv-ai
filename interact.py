@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from transformers import OpenAIGPTLMHeadModel, OpenAIGPTTokenizer, GPT2LMHeadModel, GPT2Tokenizer
-from train import SPECIAL_TOKENS, build_input_from_segments, add_special_tokens_
+from train_distil import SPECIAL_TOKENS, build_input_from_segments, add_special_tokens_
 from utils import get_dataset, download_pretrained_model
 
 def top_filtering(logits, top_k=0., top_p=0.9, threshold=-float('Inf'), filter_value=-float('Inf')):
@@ -61,7 +61,7 @@ def sample_sequence(personality, history, tokenizer, model, args, current_output
         current_output = []
 
     for i in range(args.max_length):
-        instance = build_input_from_segments(personality, history, current_output, tokenizer, with_eos=False)
+        instance = build_input_from_segments(personality, history, current_output, tokenizer, with_eos=False, truncate=args.truncate_input)
 
         input_ids = torch.tensor(instance["input_ids"], device=args.device).unsqueeze(0)
         token_type_ids = torch.tensor(instance["token_type_ids"], device=args.device).unsqueeze(0)
@@ -75,11 +75,13 @@ def sample_sequence(personality, history, tokenizer, model, args, current_output
 
         prev = torch.topk(probs, 1)[1] if args.no_sample else torch.multinomial(probs, 1)
         if i < args.min_length and prev.item() in special_tokens_ids:
-            while prev.item() in special_tokens_ids:
+            tries = 0
+            while prev.item() in special_tokens_ids and tries < 10:
                 if probs.max().item() == 1:
                     warnings.warn("Warning: model generating special token with probability 1.")
                     break  # avoid infinitely looping over special token
                 prev = torch.multinomial(probs, num_samples=1)
+                tries += 1
 
         if prev.item() in special_tokens_ids:
             break
@@ -103,6 +105,9 @@ def run():
     parser.add_argument("--temperature", type=int, default=0.7, help="Sampling softmax temperature")
     parser.add_argument("--top_k", type=int, default=0, help="Filter top-k tokens before sampling (<=0: no filtering)")
     parser.add_argument("--top_p", type=float, default=0.9, help="Nucleus filtering (top-p) before sampling (<=0.0: no filtering)")
+    parser.add_argument("--truncate_input", type=int, default=-1, help="Number of tokens to truncate model input to")
+    parser.add_argument("--model_class", type=str, help="Model class")
+    
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -115,6 +120,11 @@ def run():
         else:
             args.model_checkpoint = download_pretrained_model()
 	
+    
+    args = parser.parse_args()
+    
+    if args.truncate_input:
+        args.max_history = 500
 	
     if args.seed != 0:
     	random.seed(args.seed)
@@ -124,7 +134,18 @@ def run():
 
     logger.info("Get pretrained model and tokenizer")
     tokenizer_class, model_class = (GPT2Tokenizer, GPT2LMHeadModel) if args.model == 'gpt2' else (OpenAIGPTTokenizer, OpenAIGPTLMHeadModel)
+    if args.model_class in ["gpt2", 'distilgpt2']:
+        tokenizer_class = GPT2Tokenizer
+    else:
+        tokenizer = OpenAIGPTTokenizer # cant use Autotokenizer because checkpoint could be a Path
     tokenizer = tokenizer_class.from_pretrained(args.model_checkpoint)
+    
+    
+    
+    if args.model_class in ["gpt2", 'distilgpt2']:
+        model_class = GPT2LMHeadModel 
+    else:
+        model_class = OpenAIGPTDoubleHeadsModel
     model = model_class.from_pretrained(args.model_checkpoint)
     model.to(args.device)
     add_special_tokens_(model, tokenizer)
@@ -135,6 +156,7 @@ def run():
     personality = random.choice(personalities)
     logger.info("Selected personality: %s", tokenizer.decode(chain(*personality)))
 
+    print('WARNING: modified interact.py script for distil')
     history = []
     while True:
         raw_text = input(">>> ")

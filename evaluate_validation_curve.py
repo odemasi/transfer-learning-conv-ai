@@ -33,7 +33,7 @@ def run():
     parser = ArgumentParser()
     parser.add_argument("--dataset_path", type=str, default="", help="Path or url of the dataset. If empty download from S3.")
     parser.add_argument("--dataset_cache", type=str, default='./dataset_cache', help="Path or url of the dataset cache")
-    parser.add_argument("--model", type=str, default="openai-gpt", help="Model type (openai-gpt or gpt2)", choices=['openai-gpt', 'gpt2'])  # anything besides gpt2 will load openai-gpt
+    parser.add_argument("--model", type=str, default="openai-gpt", help="Model type (openai-gpt or gpt2)", choices=['openai-gpt', 'gpt2', 'distilgpt2'])  # anything besides gpt2 will load openai-gpt
     parser.add_argument("--model_checkpoint", type=str, default="", help="Path, url or short name of the model")
     parser.add_argument("--max_history", type=int, default=2, help="Number of previous utterances to keep in history")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device (cuda or cpu)")
@@ -65,11 +65,15 @@ def run():
 
 
     logger.info("Get pretrained model and tokenizer")
-    tokenizer_class, model_class = (GPT2Tokenizer, GPT2DoubleHeadsModel) if args.model == 'gpt2' else (OpenAIGPTTokenizer, OpenAIGPTLMHeadModel)
+    if args.model in ["gpt2", 'distilgpt2']:
+        tokenizer_class, model_class = (GPT2Tokenizer, GPT2DoubleHeadsModel)
+    else:
+        tokenizer_class, model_class = (OpenAIGPTTokenizer, OpenAIGPTLMHeadModel)
+        
     tokenizer = tokenizer_class.from_pretrained(args.model_checkpoint)
     
     
-    logger.info("Load validation dataset")
+    logger.info("Load test dataset")
     personachat = get_dataset(tokenizer, args.dataset_path, args.dataset_cache)
     datasets = {"valid": defaultdict(list)}
     dataset_name = 'valid'
@@ -82,9 +86,13 @@ def run():
     
     
     
-        
+    train_params = vars(torch.load(args.model_checkpoint + '/model_training_args.bin'))
     with open('metrics/' + checkpoint_name+'_metrics.txt', 'w') as f:
+        f.write('lm_coef,mc_coef,h_coef,model_class,tune_head_only\n')
+        param_str = ','.join(map(str, [train_params[x] for x in ['lm_coef','mc_coef','h_coef','model_class','tune_head_only']]))
+        f.write(param_str + '\n')
         f.write('iter,nll,d1,avg_len\n')
+        print(args.model_checkpoint, ':', param_str)
         
     for checkpoint_filename in checkpoint_filenames:
         

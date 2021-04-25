@@ -22,7 +22,7 @@ from transformers import (AdamW, OpenAIGPTDoubleHeadsModel, OpenAIGPTTokenizer,
                                   GPT2DoubleHeadsModel, GPT2Tokenizer, WEIGHTS_NAME, CONFIG_NAME)
 
 from utils import get_dataset, make_logdir
-import sys, shutil
+import sys, shutil, pdb
 
 SPECIAL_TOKENS = ["<bos>", "<eos>", "<speaker1>", "<speaker2>", "<pad>"]
 ATTR_TO_SPECIAL_TOKEN = {'bos_token': '<bos>', 'eos_token': '<eos>', 'pad_token': '<pad>',
@@ -56,19 +56,30 @@ def add_special_tokens_(model, tokenizer):
     if num_added_tokens > 0:
         model.resize_token_embeddings(new_num_tokens=orig_num_tokens + num_added_tokens)
 
-def build_input_from_segments(persona, history, reply, tokenizer, lm_labels=False, with_eos=True):
+def build_input_from_segments(persona, history, reply, tokenizer, lm_labels=False, with_eos=True, truncate=-1):
     """ Build a sequence of input from 3 segments: persona, history and last reply. """
     bos, eos, speaker1, speaker2 = tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS[:-1])
     sequence = [[bos] + list(chain(*persona))] + history + [reply + ([eos] if with_eos else [])]
     sequence = [sequence[0]] + [[speaker2 if (len(sequence)-i) % 2 else speaker1] + s for i, s in enumerate(sequence[1:])]
     instance = {}
-    instance["input_ids"] = list(chain(*sequence))
-    instance["token_type_ids"] = [speaker2 if i % 2 else speaker1 for i, s in enumerate(sequence) for _ in s]
-    instance["mc_token_ids"] = len(instance["input_ids"]) - 1
-    instance["lm_labels"] = [-100] * len(instance["input_ids"])
-    if lm_labels:
-        instance["lm_labels"] = ([-100] * sum(len(s) for s in sequence[:-1])) + [-100] + sequence[-1][1:]
+    
+    if truncate < 0:
+        instance["input_ids"] = list(chain(*sequence))
+        instance["token_type_ids"] = [speaker2 if i % 2 else speaker1 for i, s in enumerate(sequence) for _ in s]
+        instance["mc_token_ids"] = len(instance["input_ids"]) - 1
+        instance["lm_labels"] = [-100] * len(instance["input_ids"])
+        if lm_labels:
+            instance["lm_labels"] = ([-100] * sum(len(s) for s in sequence[:-1])) + [-100] + sequence[-1][1:]
+    else:
+        instance["input_ids"] = list(chain(*sequence))[-truncate:]
+        instance["token_type_ids"] = [speaker2 if i % 2 else speaker1 for i, s in enumerate(sequence) for _ in s][-truncate:]
+        instance["mc_token_ids"] = len(instance["input_ids"]) - 1
+        instance["lm_labels"] = [-100] * len(instance["input_ids"])
+        if lm_labels:
+            n_pad = len(instance["input_ids"]) - len(sequence[-1][1:])
+            instance["lm_labels"] = ([-100] * n_pad) + sequence[-1][1:]
     return instance
+
 
 
 def get_data_loaders(args, tokenizer):
@@ -100,7 +111,7 @@ def get_data_loaders(args, tokenizer):
                         history = utterance["history"][-(2*args.max_history+1):]
                     for j, candidate in enumerate(utterance["candidates"][-num_candidates:]):
                         lm_labels = bool(j == num_candidates-1)
-                        instance = build_input_from_segments(persona, history, candidate, tokenizer, lm_labels)
+                        instance = build_input_from_segments(persona, history, candidate, tokenizer, lm_labels, truncate=args.truncate_input)
                         for input_name, input_array in instance.items():
                             datasets[dataset_name][input_name].append(input_array)
                     datasets[dataset_name]["mc_labels"].append(num_candidates - 1)
@@ -155,10 +166,14 @@ def train():
     parser.add_argument("--h_coef", type=float, default=0, help="Entropy loss penalty coefficient")
     parser.add_argument("--tune_head_only", action='store_true', help="Freeze model and only tune linear head decoder")
     parser.add_argument("--num_candidates_valid", type=int, default=2, help="Number of candidates for validation")
+    parser.add_argument("--truncate_input", type=int, default=-1, help="Number of tokens to truncate model input to")
     
     
     args = parser.parse_args()
-
+    
+    if args.truncate_input:
+        args.max_history = 500
+        
     # logging is set to INFO (resp. WARN) for main (resp. auxiliary) process. logger.info => log main process only, logger.warning => log all processes
     logging.basicConfig(level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
     logger.warning("Running process %d", args.local_rank)  # This is a logger.warning: it will be printed by all distributed processes
@@ -233,8 +248,9 @@ def train():
             # sum over vocab and average across tokens in ground truth.
             # taking average over tokens because c-e loss default reduction is mean
             # so this should better scale to balance the c-e loss and entropy penalty. 
-            neg_ent = -(prob * log_prob).sum(dim=-1).mean() # NOTE: negative entropy
-        
+            neg_ent = (prob * log_prob).sum(dim=-1).mean() # NOTE: negative entropy
+#             pdb.set_trace()
+            assert neg_ent < 0
             h_penalty += neg_ent
         return h_penalty
         
@@ -289,8 +305,10 @@ def train():
             lm_logits, mc_logits, *_ = model(
                 input_ids, token_type_ids=token_type_ids, mc_token_ids=mc_token_ids,
             )
-            lm_logits_flat_shifted = lm_logits[..., :-1, :].contiguous().view(-1, lm_logits.size(-1))
-            lm_labels_flat_shifted = lm_labels[..., 1:].contiguous().view(-1)
+            lm_logits_shifted = lm_logits[..., :-1, :].contiguous()
+            lm_labels_shifted = lm_labels[..., 1:].contiguous()
+            lm_logits_flat_shifted = lm_logits_shifted.view(-1, lm_logits.size(-1))
+            lm_labels_flat_shifted = lm_labels_shifted.view(-1)
             
             loss_fct = torch.nn.CrossEntropyLoss()
             mc_loss = loss_fct(mc_logits.view(-1, mc_logits.size(-1)), mc_labels.view(-1))
